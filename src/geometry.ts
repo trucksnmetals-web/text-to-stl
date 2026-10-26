@@ -1,11 +1,12 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import type { Font, Glyph, PathCommand } from 'opentype.js'
-import polygonClipping, { type MultiPolygon, type Polygon, type Ring } from 'polygon-clipping'
+import polygonClipping, { type MultiPolygon, type Pair, type Polygon, type Ring } from 'polygon-clipping'
+import * as ClipperNs from 'clipper-lib'
 
 export type Align = 'left' | 'center' | 'right'
 export type EdgeStyle = 'flat' | 'chamfer' | 'round'
-export type PlateShape = 'none' | 'rect' | 'rounded' | 'pill'
+export type PlateShape = 'none' | 'outline' | 'rect' | 'rounded' | 'pill'
 export type TextStyle = 'raised' | 'engraved'
 
 export interface Settings {
@@ -24,11 +25,15 @@ export interface Settings {
   plateThickness: number
   platePadding: number
   cornerRadius: number
+  secondLayer: boolean
+  secondLayerWidth: number
+  secondLayerThickness: number
   hole: boolean
   holeDiameter: number
   quality: number
   textColor: string
   plateColor: string
+  secondLayerColor: string
 }
 
 export interface ModelResult {
@@ -38,6 +43,8 @@ export interface ModelResult {
   plate: THREE.BufferGeometry | null
   /** Engraved mode: letter-shaped pieces that fill the engraving, for 2-color prints. */
   inlay: THREE.BufferGeometry | null
+  /** Optional wider layer under the plate (stepped border). */
+  base2: THREE.BufferGeometry | null
   size: THREE.Vector3
   triangles: number
 }
@@ -249,9 +256,9 @@ function shapeToPolygon(shape: THREE.Shape, segments: number): Polygon {
  * Builds a single closed (manifold) solid: a plate whose top surface is `top`
  * (plate minus letters) with the letters sunk down to `floorZ`.
  */
-function buildEngravedPlate(top: MultiPolygon, platePoly: Polygon, T: number, floorZ: number) {
+function buildEngravedPlate(top: MultiPolygon, platePolys: MultiPolygon, T: number, floorZ: number) {
   const key = (x: number, y: number) => `${x.toFixed(4)},${y.toFixed(4)}`
-  const plateKeys = new Set(platePoly.flatMap((r) => r.map(([x, y]) => key(x, y))))
+  const plateKeys = new Set(platePolys.flat().flatMap((r) => r.map(([x, y]) => key(x, y))))
   const pos: number[] = []
 
   const ringPts = (r: Ring) => cleanContour(r.map(([x, y]) => new THREE.Vector2(x, y)))
@@ -317,7 +324,69 @@ function shapesBox(shapes: THREE.Shape[]): THREE.Box2 {
   return box
 }
 
-function plateShape(s: Settings, textBox: THREE.Box2): THREE.Shape {
+interface PlateLayer {
+  polys: MultiPolygon
+  hole: Pair | null
+}
+
+// clipper-lib is CommonJS; bundlers expose it as the namespace, Node as `default`.
+const ClipperLib = ((ClipperNs as unknown as { default?: typeof ClipperNs }).default ?? ClipperNs) as typeof ClipperNs
+const CLIP_SCALE = 1000
+
+function ringArea(r: Pair[]): number {
+  let a = 0
+  for (let i = 0, j = r.length - 1; i < r.length; j = i++) a += r[j][0] * r[i][1] - r[i][0] * r[j][1]
+  return a / 2
+}
+
+const closeRing = (r: Pair[]): Ring => [...r, [r[0][0], r[0][1]]]
+
+/** Grows (or shrinks) a multipolygon by `delta` mm. */
+function offsetMultiPolygon(mp: MultiPolygon, delta: number, fillHoles: boolean, round = true): MultiPolygon {
+  const paths: ClipperNs.Paths = mp.flatMap((poly) =>
+    poly.map((ring) => ring.slice(0, -1).map(([x, y]) => ({ X: Math.round(x * CLIP_SCALE), Y: Math.round(y * CLIP_SCALE) }))),
+  )
+  const co = new ClipperLib.ClipperOffset(2, 0.01 * CLIP_SCALE)
+  co.AddPaths(paths, round ? ClipperLib.JoinType.jtRound : ClipperLib.JoinType.jtMiter, ClipperLib.EndType.etClosedPolygon)
+  const out: ClipperNs.Paths = []
+  co.Execute(out, delta * CLIP_SCALE)
+  const rings = out
+    .filter((p) => p.length >= 3)
+    .map((p) => p.map((pt) => [pt.X / CLIP_SCALE, pt.Y / CLIP_SCALE] as Pair))
+  const outers = rings.filter((r) => ringArea(r) > 0).map((r) => [closeRing(r)] as Polygon)
+  if (!outers.length) return []
+  let result = polygonClipping.union(outers[0], ...outers.slice(1))
+  const holes = rings.filter((r) => ringArea(r) < 0).map((r) => [closeRing([...r].reverse())] as Polygon)
+  if (!fillHoles && holes.length) result = polygonClipping.difference(result, ...holes)
+  return result
+}
+
+function circlePolygon(cx: number, cy: number, r: number, segments: number): Polygon {
+  const n = Math.max(24, segments * 4)
+  const ring: Pair[] = []
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2
+    ring.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r])
+  }
+  return [closeRing(ring)]
+}
+
+/** Adds a round tab with a keychain hole to the left of an outline-shaped plate. */
+function addKeychainTab(mp: MultiPolygon, s: Settings, segments: number): PlateLayer {
+  let lx = Infinity
+  let ly = 0
+  for (const poly of mp) for (const [x, y] of poly[0]) if (x < lx) [lx, ly] = [x, y]
+  const r = s.holeDiameter / 2
+  const wall = holeWall(s)
+  const R = r + wall
+  const cx = lx - r
+  const bridgeH = R * 0.8
+  const bridge: Polygon = [closeRing([[cx, ly - bridgeH], [lx + wall, ly - bridgeH], [lx + wall, ly + bridgeH], [cx, ly + bridgeH]])]
+  const merged = polygonClipping.union(mp, circlePolygon(cx, ly, R, segments), bridge)
+  return { polys: polygonClipping.difference(merged, circlePolygon(cx, ly, r, segments)), hole: [cx, ly] }
+}
+
+function plateShape(s: Settings, textBox: THREE.Box2): { shape: THREE.Shape; hole: Pair | null } {
   const pad = s.platePadding
   let x0 = textBox.min.x - pad
   const x1 = textBox.max.x + pad
@@ -338,13 +407,33 @@ function plateShape(s: Settings, textBox: THREE.Box2): THREE.Shape {
   const h = y1 - y0
   const r = s.plate === 'rect' ? 0 : s.plate === 'pill' ? h / 2 : s.cornerRadius
   const shape = roundedRect(x0, y0, w, h, r)
+  let hole: Pair | null = null
   if (s.hole) {
     const cx = s.plate === 'pill' ? x0 + Math.max(wall + holeR, h / 2) : x0 + wall + holeR
-    const hole = new THREE.Path()
-    hole.absarc(cx, (y0 + y1) / 2, holeR, 0, Math.PI * 2, true)
-    shape.holes.push(hole)
+    const path = new THREE.Path()
+    path.absarc(cx, (y0 + y1) / 2, holeR, 0, Math.PI * 2, true)
+    shape.holes.push(path)
+    hole = [cx, (y0 + y1) / 2]
   }
-  return shape
+  return { shape, hole }
+}
+
+function plateLayer(s: Settings, letters: MultiPolygon, textBox: THREE.Box2, segments: number): PlateLayer {
+  if (s.plate === 'outline' && letters.length) {
+    const grown = offsetMultiPolygon(letters, Math.max(0.3, s.platePadding), true)
+    if (grown.length) return s.hole ? addKeychainTab(grown, s, segments) : { polys: grown, hole: null }
+  }
+  const plate = s.plate === 'outline' ? 'rounded' : s.plate
+  const { shape, hole } = plateShape({ ...s, plate }, textBox)
+  return { polys: [shapeToPolygon(shape, segments)], hole }
+}
+
+function multiPolygonToShapes(mp: MultiPolygon): THREE.Shape[] {
+  const toPts = (r: Ring) => cleanContour(r.map(([x, y]) => new THREE.Vector2(x, y)))
+  return mp
+    .map((poly) => poly.map(toPts).filter((r) => r.length >= 3))
+    .filter((rings) => rings.length)
+    .map(([outer, ...holes]) => nestedToShape({ outer, holes }))
 }
 
 function flatExtrude(shapes: THREE.Shape | THREE.Shape[], depth: number, curveSegments: number, z = 0) {
@@ -367,18 +456,37 @@ export function buildModel(font: Font, s: Settings): ModelResult {
   let text: THREE.BufferGeometry | null = null
   let plate: THREE.BufferGeometry | null = null
   let inlay: THREE.BufferGeometry | null = null
+  let base2: THREE.BufferGeometry | null = null
 
-  if (engraved) {
-    const outline = plateShape({ ...s, platePadding: Math.max(s.platePadding, 1) }, textBox)
+  const glyphPolys = allShapes.map((sh) => shapeToPolygon(sh, 1)).filter((p) => p.length)
+  const needsUnion = hasPlate && (engraved || s.plate === 'outline')
+  const letters: MultiPolygon =
+    needsUnion && glyphPolys.length ? polygonClipping.union(glyphPolys[0], ...glyphPolys.slice(1)) : []
+
+  let layer: PlateLayer | null = null
+  let plateZ = 0
+  if (hasPlate) {
+    const plateSettings = engraved ? { ...s, platePadding: Math.max(s.platePadding, 1) } : s
+    layer = plateLayer(plateSettings, letters, textBox, plateSegments)
+    if (s.secondLayer && s.secondLayerWidth > 0 && s.secondLayerThickness > 0) {
+      let polys2 = offsetMultiPolygon(layer.polys, s.secondLayerWidth, false, s.plate !== 'rect')
+      if (layer.hole) {
+        polys2 = polygonClipping.difference(polys2, circlePolygon(layer.hole[0], layer.hole[1], s.holeDiameter / 2, plateSegments))
+      }
+      base2 = flatExtrude(multiPolygonToShapes(polys2), s.secondLayerThickness, 1)
+      plateZ = s.secondLayerThickness
+    }
+  }
+
+  if (engraved && layer) {
     const T = s.plateThickness
     const d = Math.max(0.2, Math.min(s.engraveDepth, T - 0.4))
     const floorZ = T - d
-    const platePoly = shapeToPolygon(outline, plateSegments)
-    const polys = allShapes.map((sh) => shapeToPolygon(sh, 1)).filter((p) => p.length)
-    const top = polys.length ? polygonClipping.difference(platePoly, ...polys) : [platePoly]
-    const built = buildEngravedPlate(top, platePoly, T, floorZ)
+    const top = letters.length ? polygonClipping.difference(layer.polys, letters) : layer.polys
+    const built = buildEngravedPlate(top, layer.polys, T, floorZ)
     plate = built.plate
-    if (built.letterShapes.length) inlay = flatExtrude(built.letterShapes, d, 1, floorZ)
+    plate.translate(0, 0, plateZ)
+    if (built.letterShapes.length) inlay = flatExtrude(built.letterShapes, d, 1, plateZ + floorZ)
   } else {
     const bevel = s.edge !== 'flat' && s.edgeSize > 0
     const maxBevel = Math.min(s.letterHeight * 0.06, s.textDepth / 2 - 0.05)
@@ -401,25 +509,25 @@ export function buildModel(font: Font, s: Settings): ModelResult {
       )
       text = mergeGeometries(geoms, false)
       geoms.forEach((g) => g.dispose())
-      const base = hasPlate ? s.plateThickness - sink : 0
+      const base = hasPlate ? plateZ + s.plateThickness - sink : 0
       text?.translate(0, 0, base + (useBevel ? bt : 0))
     }
-    if (hasPlate) {
-      plate = flatExtrude(plateShape(s, textBox), s.plateThickness, plateSegments)
+    if (layer) {
+      plate = flatExtrude(multiPolygonToShapes(layer.polys), s.plateThickness, 1, plateZ)
       plate.clearGroups()
       plate.addGroup(0, Infinity, 0)
     }
   }
 
   const full = new THREE.Box3()
-  for (const g of [text, plate]) {
+  for (const g of [text, plate, base2]) {
     if (!g) continue
     g.computeBoundingBox()
     full.union(g.boundingBox!)
   }
   const center = full.isEmpty() ? new THREE.Vector3() : full.getCenter(new THREE.Vector3())
   const minZ = full.isEmpty() ? 0 : full.min.z
-  for (const g of [text, plate, inlay]) {
+  for (const g of [text, plate, inlay, base2]) {
     if (!g) continue
     g.translate(-center.x, -center.y, -minZ)
     g.computeBoundingBox()
@@ -428,5 +536,5 @@ export function buildModel(font: Font, s: Settings): ModelResult {
   const size = full.isEmpty() ? new THREE.Vector3() : full.getSize(new THREE.Vector3())
   const tri = (g: THREE.BufferGeometry | null) =>
     g ? (g.index ? g.index.count : g.getAttribute('position').count) / 3 : 0
-  return { text, plate, inlay, size, triangles: tri(text) + tri(plate) }
+  return { text, plate, inlay, base2, size, triangles: tri(text) + tri(plate) + tri(base2) }
 }

@@ -6,7 +6,7 @@ import opentype, { type Font } from 'opentype.js'
 import { buildModel, type Settings } from './geometry.ts'
 import { CUSTOM_FONT_ID, FONTS, fontUrl } from './fonts.ts'
 
-const STORAGE_KEY = 'text-to-stl:settings:v1'
+const STORAGE_KEY = 'text-to-stl:settings:v2'
 
 const DEFAULTS: Settings = {
   text: 'Hello',
@@ -18,17 +18,21 @@ const DEFAULTS: Settings = {
   align: 'center',
   edge: 'flat',
   edgeSize: 0.6,
-  plate: 'rounded',
+  plate: 'outline',
   textStyle: 'raised',
   engraveDepth: 1,
   plateThickness: 3,
-  platePadding: 5,
+  platePadding: 3,
+  secondLayer: false,
+  secondLayerWidth: 2.5,
+  secondLayerThickness: 1.5,
   cornerRadius: 4,
   hole: false,
   holeDiameter: 5,
   quality: 8,
   textColor: '#ff7a1a',
   plateColor: '#334155',
+  secondLayerColor: '#111827',
 }
 
 function loadSettings(): Settings {
@@ -111,7 +115,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
 
   <section class="card">
     <h2>5. Base plate</h2>
-    ${segmented('plate', [['none', 'None'], ['rect', 'Square'], ['rounded', 'Rounded'], ['pill', 'Pill']])}
+    ${segmented('plate', [['none', 'None'], ['outline', 'Outline'], ['rect', 'Square'], ['rounded', 'Rounded'], ['pill', 'Pill']])}
+    <p class="note" data-note="outline">Outline follows the shape of your letters, like a sticker border.</p>
     <p class="note" data-note="no-plate">Without a plate, letters that don't touch will print as separate pieces.</p>
     <div data-row="textStyle">
       <div class="row-label">Text on plate</div>
@@ -121,6 +126,12 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     ${numberRow({ key: 'plateThickness', label: 'Plate thickness', min: 0.6, max: 20, step: 0.2, unit: 'mm' })}
     ${numberRow({ key: 'platePadding', label: 'Border around text', min: 0, max: 40, step: 0.5, unit: 'mm' })}
     ${numberRow({ key: 'cornerRadius', label: 'Corner roundness', min: 0, max: 40, step: 0.5, unit: 'mm' })}
+    <label class="check" data-row="secondLayer">
+      <input type="checkbox" data-key="secondLayer" />
+      <span>Add second layer (stepped border)</span>
+    </label>
+    ${numberRow({ key: 'secondLayerWidth', label: 'Second layer extra border', min: 0.5, max: 20, step: 0.5, unit: 'mm' })}
+    ${numberRow({ key: 'secondLayerThickness', label: 'Second layer thickness', min: 0.4, max: 10, step: 0.2, unit: 'mm' })}
     <label class="check" data-row="hole">
       <input type="checkbox" data-key="hole" />
       <span>Add keychain hole</span>
@@ -133,8 +144,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <div class="row-label">Curve smoothness</div>
     ${segmented('quality', [['4', 'Low'], ['8', 'Medium'], ['16', 'High']])}
     <div class="colors">
-      <label><input type="color" data-key="textColor" /> Letter color</label>
-      <label data-row="plateColor"><input type="color" data-key="plateColor" /> Plate color</label>
+      <label><input type="color" data-key="textColor" /> Letters</label>
+      <label data-row="plateColor"><input type="color" data-key="plateColor" /> Plate</label>
+      <label data-row="secondLayerColor"><input type="color" data-key="secondLayerColor" /> 2nd layer</label>
     </div>
     <p class="note">Colors are only for the preview. STL files don't store color.</p>
     <button type="button" class="link" id="reset">Reset all settings</button>
@@ -246,6 +258,11 @@ function syncUi() {
   show('hole', hasPlate)
   show('holeDiameter', hasPlate && settings.hole)
   show('plateColor', hasPlate)
+  show('secondLayer', hasPlate)
+  show('secondLayerWidth', hasPlate && settings.secondLayer)
+  show('secondLayerThickness', hasPlate && settings.secondLayer)
+  show('secondLayerColor', hasPlate && settings.secondLayer)
+  $('[data-note="outline"]').classList.toggle('hidden', settings.plate !== 'outline')
   const engraved = hasPlate && settings.textStyle === 'engraved'
   show('textStyle', hasPlate)
   show('engraveDepth', engraved)
@@ -326,7 +343,9 @@ const plateMat = new THREE.MeshStandardMaterial({ color: settings.plateColor, ro
 const textMesh = new THREE.Mesh(new THREE.BufferGeometry(), textMat)
 const plateMesh = new THREE.Mesh(new THREE.BufferGeometry(), [plateMat, textMat])
 const inlayMesh = new THREE.Mesh(new THREE.BufferGeometry(), textMat)
-scene.add(textMesh, plateMesh)
+const base2Mat = new THREE.MeshStandardMaterial({ color: settings.secondLayerColor, roughness: 0.7, metalness: 0.05 })
+const base2Mesh = new THREE.Mesh(new THREE.BufferGeometry(), base2Mat)
+scene.add(textMesh, plateMesh, base2Mesh)
 
 function resize() {
   const { clientWidth: w, clientHeight: h } = wrap
@@ -342,6 +361,7 @@ function fitView(force = false) {
   const box = new THREE.Box3()
   if (textMesh.visible) box.expandByObject(textMesh)
   if (plateMesh.visible) box.expandByObject(plateMesh)
+  if (base2Mesh.visible) box.expandByObject(base2Mesh)
   if (box.isEmpty()) return
   const sphere = box.getBoundingSphere(new THREE.Sphere())
   if (!force && fittedRadius && Math.abs(sphere.radius - fittedRadius) / fittedRadius < 0.15) return
@@ -373,6 +393,7 @@ function schedule() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
   textMat.color.set(settings.textColor)
   plateMat.color.set(settings.plateColor)
+  base2Mat.color.set(settings.secondLayerColor)
   window.clearTimeout(timer)
   timer = window.setTimeout(rebuild, 120)
 }
@@ -403,6 +424,7 @@ async function rebuild() {
     assign(textMesh, model.text)
     assign(plateMesh, model.plate)
     assign(inlayMesh, model.inlay)
+    assign(base2Mesh, model.base2)
     const { x, y, z } = model.size
     $('#stats').innerHTML = model.text || model.plate
       ? `<strong>${x.toFixed(1)} × ${y.toFixed(1)} × ${z.toFixed(1)} mm</strong><span>width × depth × height · ${model.triangles.toLocaleString()} triangles</span>`
@@ -448,11 +470,11 @@ function downloadStl(meshes: THREE.Mesh[], name: string) {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000)
 }
 
-$('#download').addEventListener('click', () => downloadStl([textMesh, plateMesh], fileBase()))
+$('#download').addEventListener('click', () => downloadStl([textMesh, plateMesh, base2Mesh], fileBase()))
 $('#download-split').addEventListener('click', () => {
   const engraved = inlayMesh.visible && !textMesh.visible
   downloadStl([engraved ? inlayMesh : textMesh], `${fileBase()}-${engraved ? 'inlay' : 'letters'}`)
-  setTimeout(() => downloadStl([plateMesh], `${fileBase()}-plate`), 400)
+  setTimeout(() => downloadStl([plateMesh, base2Mesh], `${fileBase()}-plate`), 400)
 })
 
 syncUi()
