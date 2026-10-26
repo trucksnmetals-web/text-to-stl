@@ -1,10 +1,12 @@
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
 import type { Font, Glyph, PathCommand } from 'opentype.js'
+import polygonClipping, { type MultiPolygon, type Polygon, type Ring } from 'polygon-clipping'
 
 export type Align = 'left' | 'center' | 'right'
 export type EdgeStyle = 'flat' | 'chamfer' | 'round'
 export type PlateShape = 'none' | 'rect' | 'rounded' | 'pill'
+export type TextStyle = 'raised' | 'engraved'
 
 export interface Settings {
   text: string
@@ -17,6 +19,8 @@ export interface Settings {
   edge: EdgeStyle
   edgeSize: number
   plate: PlateShape
+  textStyle: TextStyle
+  engraveDepth: number
   plateThickness: number
   platePadding: number
   cornerRadius: number
@@ -28,8 +32,12 @@ export interface Settings {
 }
 
 export interface ModelResult {
+  /** Raised letters (raised mode only). */
   text: THREE.BufferGeometry | null
+  /** Base plate; in engraved mode it has the letters cut into it. */
   plate: THREE.BufferGeometry | null
+  /** Engraved mode: letter-shaped pieces that fill the engraving, for 2-color prints. */
+  inlay: THREE.BufferGeometry | null
   size: THREE.Vector3
   triangles: number
 }
@@ -113,8 +121,13 @@ function commandsToContours(cmds: PathCommand[], ox: number, oy: number, segment
   return contours
 }
 
-/** Groups contours into shapes with holes using nesting depth, independent of winding direction. */
-function contoursToShapes(contours: Contour[]): THREE.Shape[] {
+interface NestedPolygon {
+  outer: Contour
+  holes: Contour[]
+}
+
+/** Groups contours into polygons with holes using nesting depth, independent of winding direction. */
+function nestContours(contours: Contour[]): NestedPolygon[] {
   const items = contours
     .map((pts) => ({ pts, area: Math.abs(signedArea(pts)) }))
     .filter((c) => c.area > 1e-4)
@@ -131,14 +144,24 @@ function contoursToShapes(contours: Contour[]): THREE.Shape[] {
     }
     depth[i] = parent[i] === -1 ? 0 : depth[parent[i]] + 1
   }
-  const shapes = new Map<number, THREE.Shape>()
+  const polys = new Map<number, NestedPolygon>()
   items.forEach((it, i) => {
-    if (depth[i] % 2 === 0) shapes.set(i, new THREE.Shape(it.pts))
+    if (depth[i] % 2 === 0) polys.set(i, { outer: it.pts, holes: [] })
   })
   items.forEach((it, i) => {
-    if (depth[i] % 2 === 1) shapes.get(parent[i])?.holes.push(new THREE.Path(it.pts))
+    if (depth[i] % 2 === 1) polys.get(parent[i])?.holes.push(it.pts)
   })
-  return [...shapes.values()]
+  return [...polys.values()]
+}
+
+function nestedToShape(p: NestedPolygon): THREE.Shape {
+  const shape = new THREE.Shape(p.outer)
+  for (const h of p.holes) shape.holes.push(new THREE.Path(h))
+  return shape
+}
+
+function contoursToShapes(contours: Contour[]): THREE.Shape[] {
+  return nestContours(contours).map(nestedToShape)
 }
 
 function capHeightUnits(font: Font): number {
@@ -212,82 +235,180 @@ export function holeWall(s: Settings): number {
   return Math.max(2.5, s.holeDiameter * 0.6)
 }
 
+function shapeToPolygon(shape: THREE.Shape, segments: number): Polygon {
+  const { shape: outer, holes } = shape.extractPoints(segments)
+  const ring = (pts: THREE.Vector2[]): Ring => {
+    const r = cleanContour(pts).map((p) => [p.x, p.y] as [number, number])
+    if (r.length) r.push([r[0][0], r[0][1]])
+    return r
+  }
+  return [ring(outer), ...holes.map(ring)].filter((r) => r.length >= 4)
+}
+
+/**
+ * Builds a single closed (manifold) solid: a plate whose top surface is `top`
+ * (plate minus letters) with the letters sunk down to `floorZ`.
+ */
+function buildEngravedPlate(top: MultiPolygon, platePoly: Polygon, T: number, floorZ: number) {
+  const key = (x: number, y: number) => `${x.toFixed(4)},${y.toFixed(4)}`
+  const plateKeys = new Set(platePoly.flatMap((r) => r.map(([x, y]) => key(x, y))))
+  const pos: number[] = []
+
+  const ringPts = (r: Ring) => cleanContour(r.map(([x, y]) => new THREE.Vector2(x, y)))
+  const tri = (a: THREE.Vector2, az: number, b: THREE.Vector2, bz: number, c: THREE.Vector2, cz: number) =>
+    pos.push(a.x, a.y, az, b.x, b.y, bz, c.x, c.y, cz)
+
+  const cap = (outer: Contour, holes: Contour[], z: number, up: boolean) => {
+    const all = [outer, ...holes].flat()
+    const faces = THREE.ShapeUtils.triangulateShape(
+      outer.map((p) => p.clone()),
+      holes.map((h) => h.map((p) => p.clone())),
+    )
+    for (const [i, j, k] of faces) {
+      const a = all[i], b = all[j], c = all[k]
+      const ccw = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) > 0
+      if (ccw === up) tri(a, z, b, z, c, z)
+      else tri(a, z, c, z, b, z)
+    }
+  }
+
+  // Walls: orient each ring so the solid is on its left; then (a,b) quads face outward.
+  const wall = (ring: Contour, solidInside: boolean, z0: number, z1: number) => {
+    const ccw = signedArea(ring) > 0
+    const pts = ccw === solidInside ? ring : [...ring].reverse()
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length]
+      tri(a, z0, b, z0, b, z1)
+      tri(a, z0, b, z1, a, z1)
+    }
+  }
+
+  const plateRings: Contour[] = []
+  const grooveRings: Contour[] = []
+  for (const poly of top) {
+    poly.forEach((r, ri) => {
+      const pts = ringPts(r)
+      if (pts.length < 3) return
+      const onPlate = pts.filter((p) => plateKeys.has(key(p.x, p.y))).length > pts.length / 2
+      ;(onPlate ? plateRings : grooveRings).push(pts)
+      // Outer rings of `top` enclose solid; holes have solid outside.
+      wall(pts, ri === 0, onPlate ? 0 : floorZ, T)
+    })
+    const outer = ringPts(poly[0])
+    if (outer.length >= 3) cap(outer, poly.slice(1).map(ringPts).filter((h) => h.length >= 3), T, true)
+  }
+  for (const p of nestContours(plateRings)) cap(p.outer, p.holes, 0, false)
+  const floorStart = pos.length / 3
+  const floors = nestContours(grooveRings)
+  for (const p of floors) cap(p.outer, p.holes, floorZ, true)
+
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
+  geom.computeVertexNormals()
+  // Group 1 = engraving floor, so the preview can color it like the letters.
+  geom.addGroup(0, floorStart, 0)
+  geom.addGroup(floorStart, pos.length / 3 - floorStart, 1)
+  return { plate: geom, letterShapes: floors.map(nestedToShape) }
+}
+
+function shapesBox(shapes: THREE.Shape[]): THREE.Box2 {
+  const box = new THREE.Box2()
+  for (const shape of shapes) for (const p of shape.getPoints(1)) box.expandByPoint(p)
+  return box
+}
+
+function plateShape(s: Settings, textBox: THREE.Box2): THREE.Shape {
+  const pad = s.platePadding
+  let x0 = textBox.min.x - pad
+  const x1 = textBox.max.x + pad
+  let y0 = textBox.min.y - pad
+  let y1 = textBox.max.y + pad
+  const wall = holeWall(s)
+  const holeR = s.holeDiameter / 2
+  if (s.hole) {
+    const minH = s.holeDiameter + 2 * wall
+    if (y1 - y0 < minH) {
+      const cy = (y0 + y1) / 2
+      y0 = cy - minH / 2
+      y1 = cy + minH / 2
+    }
+    x0 -= s.holeDiameter + wall
+  }
+  const w = x1 - x0
+  const h = y1 - y0
+  const r = s.plate === 'rect' ? 0 : s.plate === 'pill' ? h / 2 : s.cornerRadius
+  const shape = roundedRect(x0, y0, w, h, r)
+  if (s.hole) {
+    const cx = s.plate === 'pill' ? x0 + Math.max(wall + holeR, h / 2) : x0 + wall + holeR
+    const hole = new THREE.Path()
+    hole.absarc(cx, (y0 + y1) / 2, holeR, 0, Math.PI * 2, true)
+    shape.holes.push(hole)
+  }
+  return shape
+}
+
+function flatExtrude(shapes: THREE.Shape | THREE.Shape[], depth: number, curveSegments: number, z = 0) {
+  const g = new THREE.ExtrudeGeometry(shapes, { depth, steps: 1, curveSegments, bevelEnabled: false })
+  g.translate(0, 0, z)
+  return g
+}
+
 export function buildModel(font: Font, s: Settings): ModelResult {
   const glyphShapes = layoutText(font, s)
   const allShapes = glyphShapes.flat()
-
-  const bevel = s.edge !== 'flat' && s.edgeSize > 0
-  const maxBevel = Math.min(s.letterHeight * 0.06, s.textDepth / 2 - 0.05)
-  const bt = bevel ? Math.max(0, Math.min(s.edgeSize, maxBevel)) : 0
-  const useBevel = bt > 0.01
   const hasPlate = s.plate !== 'none'
-  const sink = hasPlate ? Math.max(bt, 0.05) : 0
+  const engraved = hasPlate && s.textStyle === 'engraved'
+  const plateSegments = Math.max(12, s.quality * 3)
+
+  const textBox = allShapes.length
+    ? shapesBox(allShapes)
+    : new THREE.Box2(new THREE.Vector2(-10, -5), new THREE.Vector2(10, 5))
 
   let text: THREE.BufferGeometry | null = null
-  if (allShapes.length) {
-    const geoms = allShapes.map(
-      (shape) =>
-        new THREE.ExtrudeGeometry(shape, {
-          depth: Math.max(0.01, s.textDepth + sink - (useBevel ? 2 * bt : 0)),
-          steps: 1,
-          curveSegments: s.quality,
-          bevelEnabled: useBevel,
-          bevelThickness: bt,
-          bevelSize: bt,
-          bevelOffset: -bt,
-          bevelSegments: s.edge === 'round' ? 4 : 1,
-        }),
-    )
-    text = mergeGeometries(geoms, false)
-    geoms.forEach((g) => g.dispose())
-    if (text) {
-      const base = hasPlate ? s.plateThickness - sink : 0
-      text.translate(0, 0, base + (useBevel ? bt : 0))
-    }
-  }
-
-  const box = new THREE.Box3()
-  if (text) {
-    text.computeBoundingBox()
-    box.copy(text.boundingBox!)
-  } else {
-    box.set(new THREE.Vector3(-10, -5, 0), new THREE.Vector3(10, 5, 0))
-  }
-
   let plate: THREE.BufferGeometry | null = null
-  if (hasPlate) {
-    const pad = s.platePadding
-    let x0 = box.min.x - pad
-    const x1 = box.max.x + pad
-    let y0 = box.min.y - pad
-    let y1 = box.max.y + pad
-    const wall = holeWall(s)
-    const holeR = s.holeDiameter / 2
-    if (s.hole) {
-      const minH = s.holeDiameter + 2 * wall
-      if (y1 - y0 < minH) {
-        const cy = (y0 + y1) / 2
-        y0 = cy - minH / 2
-        y1 = cy + minH / 2
-      }
-      x0 -= s.holeDiameter + wall
+  let inlay: THREE.BufferGeometry | null = null
+
+  if (engraved) {
+    const outline = plateShape({ ...s, platePadding: Math.max(s.platePadding, 1) }, textBox)
+    const T = s.plateThickness
+    const d = Math.max(0.2, Math.min(s.engraveDepth, T - 0.4))
+    const floorZ = T - d
+    const platePoly = shapeToPolygon(outline, plateSegments)
+    const polys = allShapes.map((sh) => shapeToPolygon(sh, 1)).filter((p) => p.length)
+    const top = polys.length ? polygonClipping.difference(platePoly, ...polys) : [platePoly]
+    const built = buildEngravedPlate(top, platePoly, T, floorZ)
+    plate = built.plate
+    if (built.letterShapes.length) inlay = flatExtrude(built.letterShapes, d, 1, floorZ)
+  } else {
+    const bevel = s.edge !== 'flat' && s.edgeSize > 0
+    const maxBevel = Math.min(s.letterHeight * 0.06, s.textDepth / 2 - 0.05)
+    const bt = bevel ? Math.max(0, Math.min(s.edgeSize, maxBevel)) : 0
+    const useBevel = bt > 0.01
+    const sink = hasPlate ? Math.max(bt, 0.05) : 0
+    if (allShapes.length) {
+      const geoms = allShapes.map(
+        (shape) =>
+          new THREE.ExtrudeGeometry(shape, {
+            depth: Math.max(0.01, s.textDepth + sink - (useBevel ? 2 * bt : 0)),
+            steps: 1,
+            curveSegments: s.quality,
+            bevelEnabled: useBevel,
+            bevelThickness: bt,
+            bevelSize: bt,
+            bevelOffset: -bt,
+            bevelSegments: s.edge === 'round' ? 4 : 1,
+          }),
+      )
+      text = mergeGeometries(geoms, false)
+      geoms.forEach((g) => g.dispose())
+      const base = hasPlate ? s.plateThickness - sink : 0
+      text?.translate(0, 0, base + (useBevel ? bt : 0))
     }
-    const w = x1 - x0
-    const h = y1 - y0
-    const r = s.plate === 'rect' ? 0 : s.plate === 'pill' ? h / 2 : s.cornerRadius
-    const shape = roundedRect(x0, y0, w, h, r)
-    if (s.hole) {
-      const cx = s.plate === 'pill' ? x0 + Math.max(wall + holeR, h / 2) : x0 + wall + holeR
-      const hole = new THREE.Path()
-      hole.absarc(cx, (y0 + y1) / 2, holeR, 0, Math.PI * 2, true)
-      shape.holes.push(hole)
+    if (hasPlate) {
+      plate = flatExtrude(plateShape(s, textBox), s.plateThickness, plateSegments)
+      plate.clearGroups()
+      plate.addGroup(0, Infinity, 0)
     }
-    plate = new THREE.ExtrudeGeometry(shape, {
-      depth: s.plateThickness,
-      steps: 1,
-      curveSegments: Math.max(12, s.quality * 3),
-      bevelEnabled: false,
-    })
   }
 
   const full = new THREE.Box3()
@@ -296,15 +417,16 @@ export function buildModel(font: Font, s: Settings): ModelResult {
     g.computeBoundingBox()
     full.union(g.boundingBox!)
   }
-  const center = full.getCenter(new THREE.Vector3())
-  for (const g of [text, plate]) {
+  const center = full.isEmpty() ? new THREE.Vector3() : full.getCenter(new THREE.Vector3())
+  const minZ = full.isEmpty() ? 0 : full.min.z
+  for (const g of [text, plate, inlay]) {
     if (!g) continue
-    g.translate(-center.x, -center.y, -full.min.z)
+    g.translate(-center.x, -center.y, -minZ)
     g.computeBoundingBox()
     g.computeBoundingSphere()
   }
   const size = full.isEmpty() ? new THREE.Vector3() : full.getSize(new THREE.Vector3())
   const tri = (g: THREE.BufferGeometry | null) =>
     g ? (g.index ? g.index.count : g.getAttribute('position').count) / 3 : 0
-  return { text, plate, size, triangles: tri(text) + tri(plate) }
+  return { text, plate, inlay, size, triangles: tri(text) + tri(plate) }
 }

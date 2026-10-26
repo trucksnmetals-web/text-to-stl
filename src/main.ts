@@ -19,6 +19,8 @@ const DEFAULTS: Settings = {
   edge: 'flat',
   edgeSize: 0.6,
   plate: 'rounded',
+  textStyle: 'raised',
+  engraveDepth: 1,
   plateThickness: 3,
   platePadding: 5,
   cornerRadius: 4,
@@ -101,7 +103,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     ${numberRow({ key: 'lineSpacing', label: 'Line spacing', hint: 'Times the letter height', min: 0.8, max: 3, step: 0.05, unit: '×' })}
   </section>
 
-  <section class="card">
+  <section class="card" data-row="edgeCard">
     <h2>4. Letter edges</h2>
     ${segmented('edge', [['flat', 'Flat'], ['chamfer', 'Chamfer'], ['round', 'Rounded']])}
     ${numberRow({ key: 'edgeSize', label: 'Edge size', min: 0.1, max: 3, step: 0.1, unit: 'mm' })}
@@ -111,6 +113,11 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <h2>5. Base plate</h2>
     ${segmented('plate', [['none', 'None'], ['rect', 'Square'], ['rounded', 'Rounded'], ['pill', 'Pill']])}
     <p class="note" data-note="no-plate">Without a plate, letters that don't touch will print as separate pieces.</p>
+    <div data-row="textStyle">
+      <div class="row-label">Text on plate</div>
+      ${segmented('textStyle', [['raised', 'Raised (embossed)'], ['engraved', 'Cut in (engraved)']])}
+    </div>
+    ${numberRow({ key: 'engraveDepth', label: 'Engrave depth', hint: 'How deep the letters are cut in', min: 0.2, max: 10, step: 0.1, unit: 'mm' })}
     ${numberRow({ key: 'plateThickness', label: 'Plate thickness', min: 0.6, max: 20, step: 0.2, unit: 'mm' })}
     ${numberRow({ key: 'platePadding', label: 'Border around text', min: 0, max: 40, step: 0.5, unit: 'mm' })}
     ${numberRow({ key: 'cornerRadius', label: 'Corner roundness', min: 0, max: 40, step: 0.5, unit: 'mm' })}
@@ -239,9 +246,16 @@ function syncUi() {
   show('hole', hasPlate)
   show('holeDiameter', hasPlate && settings.hole)
   show('plateColor', hasPlate)
+  const engraved = hasPlate && settings.textStyle === 'engraved'
+  show('textStyle', hasPlate)
+  show('engraveDepth', engraved)
+  show('textDepth', !engraved)
+  show('edgeCard', !engraved)
   show('edgeSize', settings.edge !== 'flat')
   $('[data-note="no-plate"]').classList.toggle('hidden', hasPlate)
-  $('#download-split').classList.toggle('hidden', !hasPlate)
+  const split = $('#download-split')
+  split.classList.toggle('hidden', !hasPlate)
+  split.innerHTML = engraved ? 'Separate plate &amp; letter inlay (2-color)' : 'Separate letters &amp; plate (2-color)'
 }
 
 function setValue(key: keyof Settings, raw: string | boolean) {
@@ -310,7 +324,8 @@ scene.add(grid)
 const textMat = new THREE.MeshStandardMaterial({ color: settings.textColor, roughness: 0.55, metalness: 0.05 })
 const plateMat = new THREE.MeshStandardMaterial({ color: settings.plateColor, roughness: 0.7, metalness: 0.05 })
 const textMesh = new THREE.Mesh(new THREE.BufferGeometry(), textMat)
-const plateMesh = new THREE.Mesh(new THREE.BufferGeometry(), plateMat)
+const plateMesh = new THREE.Mesh(new THREE.BufferGeometry(), [plateMat, textMat])
+const inlayMesh = new THREE.Mesh(new THREE.BufferGeometry(), textMat)
 scene.add(textMesh, plateMesh)
 
 function resize() {
@@ -380,12 +395,14 @@ async function rebuild() {
   if (id !== buildId) return
   try {
     const model = buildModel(font, settings)
-    textMesh.geometry.dispose()
-    plateMesh.geometry.dispose()
-    textMesh.geometry = model.text ?? new THREE.BufferGeometry()
-    plateMesh.geometry = model.plate ?? new THREE.BufferGeometry()
-    textMesh.visible = Boolean(model.text)
-    plateMesh.visible = Boolean(model.plate)
+    const assign = (mesh: THREE.Mesh, geom: THREE.BufferGeometry | null) => {
+      mesh.geometry.dispose()
+      mesh.geometry = geom ?? new THREE.BufferGeometry()
+      mesh.visible = Boolean(geom)
+    }
+    assign(textMesh, model.text)
+    assign(plateMesh, model.plate)
+    assign(inlayMesh, model.inlay)
     const { x, y, z } = model.size
     $('#stats').innerHTML = model.text || model.plate
       ? `<strong>${x.toFixed(1)} × ${y.toFixed(1)} × ${z.toFixed(1)} mm</strong><span>width × depth × height · ${model.triangles.toLocaleString()} triangles</span>`
@@ -433,7 +450,8 @@ function downloadStl(meshes: THREE.Mesh[], name: string) {
 
 $('#download').addEventListener('click', () => downloadStl([textMesh, plateMesh], fileBase()))
 $('#download-split').addEventListener('click', () => {
-  downloadStl([textMesh], `${fileBase()}-letters`)
+  const engraved = inlayMesh.visible && !textMesh.visible
+  downloadStl([engraved ? inlayMesh : textMesh], `${fileBase()}-${engraved ? 'inlay' : 'letters'}`)
   setTimeout(() => downloadStl([plateMesh], `${fileBase()}-plate`), 400)
 })
 

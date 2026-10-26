@@ -6,8 +6,9 @@ A free, in-browser tool that turns text into 3D-printable STL files.
 - Set letter height, thickness, letter spacing and line spacing in millimetres
 - Flat, chamfered or rounded letter edges
 - Optional base plate (square, rounded or pill) with an optional keychain hole
+- Text on the plate can be raised (embossed) or cut in (engraved) to a chosen depth; engraved plates are built as one watertight solid via 2D boolean ops (polygon-clipping)
 - Live 3D preview, then download a binary STL (units: mm, lying flat, Z up)
-- "Separate letters & plate" downloads two aligned STLs for 2-color printing
+- "Separate letters & plate" downloads two aligned STLs for 2-color printing (for engraved plates: the plate plus letter inlays that fill the engraving)
 
 Everything runs client-side (three.js + opentype.js); there is no server.
 
