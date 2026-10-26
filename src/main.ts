@@ -162,6 +162,8 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   <div class="downloads">
     <button type="button" class="primary" id="download">Download STL</button>
     <button type="button" class="secondary" id="download-split" title="Two files that line up, for printing letters and plate in different colors">Separate letters &amp; plate (2-color)</button>
+    <p class="frame-note" id="frame-note" hidden>Download not starting? This preview window can block downloads.
+      <a href="./" target="_blank" rel="noopener">Open the site in its own browser tab</a> and download from there.</p>
   </div>
   <div class="error" id="error" hidden></div>
 </main>
@@ -469,6 +471,15 @@ function downloadStl(meshes: THREE.Mesh[], name: string) {
   a.remove()
   setTimeout(() => URL.revokeObjectURL(a.href), 2000)
 }
+
+const embedded = (() => {
+  try {
+    return window.self !== window.top
+  } catch {
+    return true
+  }
+})()
+if (embedded) $('#frame-note').hidden = false
 
 $('#download').addEventListener('click', () => downloadStl([textMesh, plateMesh, base2Mesh], fileBase()))
 $('#download-split').addEventListener('click', () => {
