@@ -1,5 +1,7 @@
 # Text to STL
 
+Live site: https://trucksnmetals-web.github.io/text-to-stl/
+
 A free, in-browser tool that turns text into 3D-printable STL files.
 
 - Pick from 16 bundled open-source fonts (or upload your own `.ttf` / `.otf`)
