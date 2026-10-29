@@ -5,6 +5,7 @@ import { STLExporter } from 'three/examples/jsm/exporters/STLExporter.js'
 import opentype, { type Font } from 'opentype.js'
 import { buildModel, type Settings } from './geometry.ts'
 import { CUSTOM_FONT_ID, FONTS, fontUrl } from './fonts.ts'
+import { build3mf } from './threemf.ts'
 
 const STORAGE_KEY = 'text-to-stl:settings:v2'
 
@@ -161,6 +162,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
   </div>
   <div class="downloads">
     <button type="button" class="primary" id="download">Download STL</button>
+    <button type="button" class="primary" id="download-3mf" title="One file with letters and plate as separate colored parts (Orca, Bambu Studio, PrusaSlicer)">Download 3MF (with colors)</button>
     <button type="button" class="secondary" id="download-split" title="Two files that line up, for printing letters and plate in different colors">Separate letters &amp; plate (2-color)</button>
     <p class="frame-note" id="frame-note" hidden>Download not starting? This preview window can block downloads.
       <a href="./" target="_blank" rel="noopener">Open the site in its own browser tab</a> and download from there.</p>
@@ -451,6 +453,34 @@ function fileBase() {
   return slug || 'text'
 }
 
+function saveBlob(blob: Blob, filename: string) {
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000)
+}
+
+function download3mf() {
+  const letters = textMesh.visible ? textMesh : inlayMesh
+  const candidates: [string, THREE.Mesh, string][] = [
+    ['Letters', letters, settings.textColor],
+    ['Plate', plateMesh, settings.plateColor],
+    ['Second layer', base2Mesh, settings.secondLayerColor],
+  ]
+  const parts = candidates
+    .filter(([, m]) => m.visible && m.geometry.getAttribute('position'))
+    .map(([name, m, color]) => ({ name, color, geometry: m.geometry }))
+  if (!parts.length) {
+    showError('Nothing to download yet. Type some text first.')
+    return
+  }
+  const data = build3mf(parts, fileBase())
+  saveBlob(new Blob([data as BlobPart], { type: 'model/3mf' }), `${fileBase()}.3mf`)
+}
+
 function downloadStl(meshes: THREE.Mesh[], name: string) {
   const group = new THREE.Group()
   for (const m of meshes) {
@@ -462,14 +492,7 @@ function downloadStl(meshes: THREE.Mesh[], name: string) {
   }
   group.updateMatrixWorld(true)
   const data = new STLExporter().parse(group, { binary: true }) as DataView
-  const blob = new Blob([data.buffer as ArrayBuffer], { type: 'model/stl' })
-  const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
-  a.download = `${name}.stl`
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  setTimeout(() => URL.revokeObjectURL(a.href), 2000)
+  saveBlob(new Blob([data.buffer as ArrayBuffer], { type: 'model/stl' }), `${name}.stl`)
 }
 
 const embedded = (() => {
@@ -482,6 +505,7 @@ const embedded = (() => {
 if (embedded) $('#frame-note').hidden = false
 
 $('#download').addEventListener('click', () => downloadStl([textMesh, plateMesh, base2Mesh], fileBase()))
+$('#download-3mf').addEventListener('click', download3mf)
 $('#download-split').addEventListener('click', () => {
   const engraved = inlayMesh.visible && !textMesh.visible
   downloadStl([engraved ? inlayMesh : textMesh], `${fileBase()}-${engraved ? 'inlay' : 'letters'}`)
