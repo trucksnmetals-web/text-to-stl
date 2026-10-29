@@ -91,6 +91,7 @@ textarea:focus, input[type='number']:focus { outline: 2px solid var(--accent); o
 .note { font-size: 12px; color: var(--muted); margin: 6px 0; }
 .link { background: none; border: 0; color: var(--muted); text-decoration: underline; cursor: pointer; padding: 0; font: inherit; font-size: 12px; margin-top: 6px; }
 .hidden { display: none !important; }
+.lbl-short { display: none; }
 
 .viewer { flex: 1; position: relative; min-width: 0; }
 #canvas-wrap { position: absolute; inset: 0; }
@@ -118,7 +119,17 @@ button.ghost { background: rgba(255,255,255,.92); border: 1px solid var(--line);
 @media (max-width: 820px) {
   #app { flex-direction: column-reverse; height: auto; }
   .panel { width: 100%; border-right: 0; overflow: visible; }
-  .viewer { height: 60vh; position: sticky; top: 0; z-index: 1; }
-  .downloads button { padding: 10px 14px; }
-  .primary { font-size: 15px; }
+  .viewer { flex: none; height: 52vh; height: 52svh; position: sticky; top: 0; z-index: 1; border-bottom: 1px solid var(--line); background: var(--bg); }
+  .hud { top: 10px; left: 10px; right: 10px; }
+  .stats { padding: 6px 10px; font-size: 12px; }
+  .stats strong { font-size: 15px; }
+  .downloads { bottom: 10px; gap: 6px; width: calc(100% - 20px); }
+  .downloads button { padding: 9px 12px; }
+  .primary { font-size: 14px; }
+  .secondary { font-size: 13px; }
+  .downloads { flex-wrap: nowrap; }
+  .downloads .frame-note { display: none; }
+  .lbl-long { display: none; }
+  .lbl-short { display: inline; }
+  .downloads button { white-space: nowrap; padding: 9px 10px; min-width: 0; }
 }

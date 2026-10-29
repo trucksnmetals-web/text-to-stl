@@ -149,7 +149,7 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
       <label data-row="plateColor"><input type="color" data-key="plateColor" /> Plate</label>
       <label data-row="secondLayerColor"><input type="color" data-key="secondLayerColor" /> 2nd layer</label>
     </div>
-    <p class="note">Colors are only for the preview. STL files don't store color.</p>
+    <p class="note">STL files don't store color. Use Download 3MF to keep these colors.</p>
     <button type="button" class="link" id="reset">Reset all settings</button>
   </section>
 </aside>
@@ -161,9 +161,9 @@ document.querySelector<HTMLDivElement>('#app')!.innerHTML = `
     <button type="button" class="ghost" id="fit">Fit view</button>
   </div>
   <div class="downloads">
-    <button type="button" class="primary" id="download">Download STL</button>
-    <button type="button" class="primary" id="download-3mf" title="One file with letters and plate as separate colored parts (Orca, Bambu Studio, PrusaSlicer)">Download 3MF (with colors)</button>
-    <button type="button" class="secondary" id="download-split" title="Two files that line up, for printing letters and plate in different colors">Separate letters &amp; plate (2-color)</button>
+    <button type="button" class="primary" id="download"><span class="lbl-long">Download STL</span><span class="lbl-short">Download STL</span></button>
+    <button type="button" class="primary" id="download-3mf" title="One file with letters and plate as separate colored parts (Orca, Bambu Studio, PrusaSlicer)"><span class="lbl-long">Download 3MF (with colors)</span><span class="lbl-short">3MF (colors)</span></button>
+    <button type="button" class="secondary" id="download-split" title="Two files that line up, for printing letters and plate in different colors"><span class="lbl-long">Separate letters &amp; plate (2-color)</span><span class="lbl-short">2-color STLs</span></button>
     <p class="frame-note" id="frame-note" hidden>Download not starting? This preview window can block downloads.
       <a href="./" target="_blank" rel="noopener">Open the site in its own browser tab</a> and download from there.</p>
   </div>
@@ -276,7 +276,7 @@ function syncUi() {
   $('[data-note="no-plate"]').classList.toggle('hidden', hasPlate)
   const split = $('#download-split')
   split.classList.toggle('hidden', !hasPlate)
-  split.innerHTML = engraved ? 'Separate plate &amp; letter inlay (2-color)' : 'Separate letters &amp; plate (2-color)'
+  split.innerHTML = `<span class="lbl-long">${engraved ? 'Separate plate &amp; letter inlay (2-color)' : 'Separate letters &amp; plate (2-color)'}</span><span class="lbl-short">2-color STLs</span>`
 }
 
 function setValue(key: keyof Settings, raw: string | boolean) {
